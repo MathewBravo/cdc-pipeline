@@ -38,13 +38,13 @@ func main() {
 	// 5. Main loop - consume events or wait for shutdown
 	go func() {
 		for event := range eventCh {
-			fmt.Printf("📦 Received event: %+v\n", event)
+			fmt.Printf("Received event: %+v\n", event)
 		}
 	}()
 
 	// Wait for shutdown signal
 	<-sigCh
-	fmt.Println("\n🛑 Shutting down...")
+	fmt.Println("\nShutting down...")
 
 	// 6. Stop connector
 	if err := conn.Stop(); err != nil {

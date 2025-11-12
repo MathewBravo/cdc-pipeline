@@ -8,6 +8,13 @@
 //  4. Map these messages into events.ChangeEvent structs and push them to eventChan.
 //  5. (Later) Send periodic standby status updates to prevent connection timeout.
 
+// Resources For Writeup
+// https://www.postgresql.org/docs/16//protocol-replication.html
+// https://packagemain.tech/p/real-time-database-change-tracking
+// https://pkg.go.dev/github.com/jackc/pglogrepl
+// https://pkg.go.dev/github.com/jackc/pgx/v5/pgproto3
+// https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn
+
 package connector
 
 import (
@@ -19,6 +26,7 @@ import (
 	"github.com/MathewBravo/cdc-pipeline/internal/events"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 type PostgresConnector struct {
@@ -28,6 +36,8 @@ type PostgresConnector struct {
 	eventChan chan events.ChangeEvent
 	stopChan  chan struct{}
 }
+
+type PGMessage struct{}
 
 func NewPGConnector(cfg configs.SourceConfig) *PostgresConnector {
 	return &PostgresConnector{
@@ -113,7 +123,50 @@ func (p *PostgresConnector) replicationLoop() {
 				fmt.Printf("Error receiving message: %v\n", err)
 				return
 			}
+			ReadMessage(msg)
 			fmt.Printf("Received message: %T\n", msg)
 		}
 	}
+}
+
+func ReadMessage(bm pgproto3.BackendMessage) {
+	copyD, ok := bm.(*pgproto3.CopyData)
+	if !ok {
+		fmt.Println("ReceiveMessage that was not CopyData message")
+		return
+	}
+
+	data := copyD.Data
+	if len(data) < 1 {
+		fmt.Println("Recieved empty data message")
+		return
+	}
+
+	msgType := data[0]
+	switch msgType {
+	case 'w':
+		fmt.Println("WAL")
+		xlog, err := pglogrepl.ParseXLogData(data[1:])
+		if err != nil {
+			fmt.Println("Could not parse XlogData: ", err)
+			return
+		}
+		fmt.Println("XlogData: WAL")
+
+		fmt.Println("time: ", xlog.ServerTime.UTC().String())
+		wd, err := pglogrepl.Parse(xlog.WALData)
+		if err != nil {
+			fmt.Println("PARSE ERR: Could not parse WAL data: ", err)
+		}
+		handleLogicalReplicationMessage(wd)
+
+	case 'k':
+		fmt.Println("KEEP ALIVE")
+	default:
+		fmt.Printf("Unknown replication message type: %c (0x%02x)\n", msgType, msgType)
+	}
+}
+
+func handleLogicalReplicationMessage(walMessage pglogrepl.Message) {
+	fmt.Println("Message Type: ", walMessage.Type().String())
 }
