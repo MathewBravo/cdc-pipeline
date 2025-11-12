@@ -37,7 +37,9 @@ type PostgresConnector struct {
 	stopChan  chan struct{}
 }
 
-type PGMessage struct{}
+type LatestMessage struct {
+	lastRecievedLSN pglogrepl.LSN
+}
 
 func NewPGConnector(cfg configs.SourceConfig) *PostgresConnector {
 	return &PostgresConnector{
@@ -87,6 +89,8 @@ func (p *PostgresConnector) replicationLoop() {
 
 	fmt.Println("DEBUG: Starting logical replication...")
 
+	var lm LatestMessage
+
 	opts := pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{
 			"proto_version '1'",
@@ -123,13 +127,12 @@ func (p *PostgresConnector) replicationLoop() {
 				fmt.Printf("Error receiving message: %v\n", err)
 				return
 			}
-			ReadMessage(msg)
-			fmt.Printf("Received message: %T\n", msg)
+			ReadMessage(msg, &lm, p.replConn)
 		}
 	}
 }
 
-func ReadMessage(bm pgproto3.BackendMessage) {
+func ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage, conn *pgconn.PgConn) {
 	copyD, ok := bm.(*pgproto3.CopyData)
 	if !ok {
 		fmt.Println("ReceiveMessage that was not CopyData message")
@@ -145,28 +148,48 @@ func ReadMessage(bm pgproto3.BackendMessage) {
 	msgType := data[0]
 	switch msgType {
 	case 'w':
-		fmt.Println("WAL")
 		xlog, err := pglogrepl.ParseXLogData(data[1:])
 		if err != nil {
 			fmt.Println("Could not parse XlogData: ", err)
 			return
 		}
-		fmt.Println("XlogData: WAL")
 
-		fmt.Println("time: ", xlog.ServerTime.UTC().String())
+		lm.lastRecievedLSN = xlog.WALStart
 		wd, err := pglogrepl.Parse(xlog.WALData)
 		if err != nil {
 			fmt.Println("PARSE ERR: Could not parse WAL data: ", err)
 		}
-		handleLogicalReplicationMessage(wd)
 
+		handleLogicalReplicationMessage(wd)
 	case 'k':
-		fmt.Println("KEEP ALIVE")
+		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{
+			WALWritePosition: lm.lastRecievedLSN,
+			WALFlushPosition: lm.lastRecievedLSN,
+			WALApplyPosition: lm.lastRecievedLSN,
+			ClientTime:       time.Now(),
+			ReplyRequested:   false,
+		})
+		if err != nil {
+			fmt.Println("ERR: Could not send standby status: ", err)
+		}
 	default:
 		fmt.Printf("Unknown replication message type: %c (0x%02x)\n", msgType, msgType)
 	}
 }
 
 func handleLogicalReplicationMessage(walMessage pglogrepl.Message) {
-	fmt.Println("Message Type: ", walMessage.Type().String())
+	switch walMessage.Type() {
+	case pglogrepl.MessageTypeBegin:
+		fmt.Println("BEGIN MESSAGE")
+	case pglogrepl.MessageTypeCommit:
+		fmt.Println("COMMIT MESSAGE")
+	case pglogrepl.MessageTypeInsert:
+		fmt.Println("INSERT MESSAGE")
+	case pglogrepl.MessageTypeUpdate:
+		fmt.Println("UPDATE MESSAGE")
+	case pglogrepl.MessageTypeDelete:
+		fmt.Println("DELETE MESSAGE")
+	default:
+		fmt.Printf("OTHER MESSAGE: %s\n", walMessage.Type().String())
+	}
 }
