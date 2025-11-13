@@ -12,7 +12,10 @@ package connector
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/MathewBravo/cdc-pipeline/internal/configs"
@@ -24,14 +27,12 @@ import (
 
 type PostgresConnector struct {
 	// config, db connection, etc.
-	config        configs.SourceConfig
-	replConn      *pgconn.PgConn
-	eventChan     chan events.ChangeEvent
-	stopChan      chan struct{}
-	relationCache map[uint32]pglogrepl.RelationMessage
-}
-
-type LatestMessage struct {
+	config          configs.SourceConfig
+	replConn        *pgconn.PgConn
+	eventChan       chan events.ChangeEvent
+	stopChan        chan struct{}
+	wg              sync.WaitGroup
+	relationCache   map[uint32]pglogrepl.RelationMessage
 	lastRecievedLSN pglogrepl.LSN
 }
 
@@ -59,6 +60,7 @@ func (p *PostgresConnector) Start() (<-chan events.ChangeEvent, error) {
 	p.replConn = replConn
 
 	fmt.Println("DEBUG: Starting replication goroutine...")
+	p.wg.Add(1)
 	go p.replicationLoop()
 
 	fmt.Println("DEBUG: Returning event channel...")
@@ -69,6 +71,10 @@ func (p *PostgresConnector) Stop() error {
 	// 1. Signal goroutine to stop
 	// 2. Close channel
 	// 3. Cleanup resources
+	p.stopChan <- struct{}{}
+	p.replConn.Close(context.Background())
+	p.wg.Wait()
+	close(p.eventChan)
 	return nil
 }
 
@@ -77,14 +83,20 @@ func (p *PostgresConnector) buildConnString() string {
 }
 
 func (p *PostgresConnector) replicationLoop() {
+	defer p.wg.Done()
+
 	fmt.Println("DEBUG: Beginning replication loop...")
 	ctx := context.Background()
 
-	startLSN := pglogrepl.LSN(0)
+	lsn, err := fetchLastLSN()
+	if err != nil {
+		fmt.Println("LSN ERR: Error fetching last LSN: ", err)
+		return
+	}
+
+	p.lastRecievedLSN = lsn
 
 	fmt.Println("DEBUG: Starting logical replication...")
-
-	var lm LatestMessage
 
 	opts := pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{
@@ -93,7 +105,7 @@ func (p *PostgresConnector) replicationLoop() {
 		},
 	}
 
-	if err := pglogrepl.StartReplication(ctx, p.replConn, p.config.SlotName, startLSN, opts); err != nil {
+	if err := pglogrepl.StartReplication(ctx, p.replConn, p.config.SlotName, p.lastRecievedLSN, opts); err != nil {
 		fmt.Printf("REPLICATION ERROR: failed to start replication: %v\n", err)
 		return
 	}
@@ -111,6 +123,7 @@ func (p *PostgresConnector) replicationLoop() {
 		case <-ticker.C:
 			// TODO: Send standby status update
 			fmt.Println("Heartbeat tick")
+			p.sendStatusUpdate()
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			msg, err := p.replConn.ReceiveMessage(ctx)
@@ -122,12 +135,12 @@ func (p *PostgresConnector) replicationLoop() {
 				fmt.Printf("Error receiving message: %v\n", err)
 				return
 			}
-			p.ReadMessage(msg, &lm)
+			p.ReadMessage(msg)
 		}
 	}
 }
 
-func (p *PostgresConnector) ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage) {
+func (p *PostgresConnector) ReadMessage(bm pgproto3.BackendMessage) {
 	copyD, ok := bm.(*pgproto3.CopyData)
 	if !ok {
 		fmt.Println("ReceiveMessage that was not CopyData message")
@@ -149,30 +162,21 @@ func (p *PostgresConnector) ReadMessage(bm pgproto3.BackendMessage, lm *LatestMe
 			return
 		}
 
-		lm.lastRecievedLSN = xlog.WALStart
+		p.lastRecievedLSN = xlog.WALStart
 		wd, err := pglogrepl.Parse(xlog.WALData)
 		if err != nil {
 			fmt.Println("PARSE ERR: Could not parse WAL data: ", err)
 		}
 
-		p.handleLogicalReplicationMessage(wd, lm)
+		p.handleLogicalReplicationMessage(wd)
 	case 'k':
-		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), p.replConn, pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: lm.lastRecievedLSN,
-			WALFlushPosition: lm.lastRecievedLSN,
-			WALApplyPosition: lm.lastRecievedLSN,
-			ClientTime:       time.Now(),
-			ReplyRequested:   false,
-		})
-		if err != nil {
-			fmt.Println("ERR: Could not send standby status: ", err)
-		}
+		p.sendStatusUpdate()
 	default:
 		fmt.Printf("Unknown replication message type: %c (0x%02x)\n", msgType, msgType)
 	}
 }
 
-func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl.Message, lm *LatestMessage) {
+func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl.Message) {
 	switch walMessage.Type() {
 	case pglogrepl.MessageTypeRelation:
 		relationMsg, ok := walMessage.(*pglogrepl.RelationMessage)
@@ -193,14 +197,64 @@ func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl
 
 		ce := events.ChangeEvent{
 			Operation: events.OperationUpdate,
+			NameSpace: relMsg.Namespace,
 			Table:     relMsg.RelationName,
 			Before:    oldData,
 			After:     newData,
-			Lsn:       lm.lastRecievedLSN.String(),
+			Lsn:       p.lastRecievedLSN.String(),
 		}
 
 		fmt.Println(ce.Pretty())
+		p.eventChan <- ce
 		return
+	case pglogrepl.MessageTypeDelete:
+		deleteMsg, ok := walMessage.(*pglogrepl.DeleteMessage)
+		if !ok {
+			return
+		}
+		relMsg := p.relationCache[deleteMsg.RelationID]
+
+		delData := parseTupleData(deleteMsg.OldTuple, &relMsg)
+
+		ce := events.ChangeEvent{
+			Operation: events.OperationDelete,
+			NameSpace: relMsg.Namespace,
+			Table:     relMsg.RelationName,
+			Before:    delData,
+			After:     nil,
+			Lsn:       p.lastRecievedLSN.String(),
+		}
+
+		fmt.Println(ce.Pretty())
+		p.eventChan <- ce
+		return
+	case pglogrepl.MessageTypeInsert:
+		insertMsg, ok := walMessage.(*pglogrepl.InsertMessage)
+		if !ok {
+			return
+		}
+		relMsg := p.relationCache[insertMsg.RelationID]
+
+		newData := parseTupleData(insertMsg.Tuple, &relMsg)
+
+		ce := events.ChangeEvent{
+			Operation: events.OperationInsert,
+			NameSpace: relMsg.Namespace,
+			Table:     relMsg.RelationName,
+			Before:    nil,
+			After:     newData,
+			Lsn:       p.lastRecievedLSN.String(),
+		}
+
+		fmt.Println(ce.Pretty())
+		p.eventChan <- ce
+		return
+
+	case pglogrepl.MessageTypeCommit:
+		lsnStr := p.lastRecievedLSN.String()
+		fmt.Println("DEBUG: Writing lsn log")
+		logLSN(lsnStr)
+
 	default:
 		fmt.Println("MESSAGE TYPE: ", walMessage.Type().String())
 	}
@@ -258,4 +312,67 @@ func parseByOID(data []byte, oid uint32) any {
 	default:
 		return text
 	}
+}
+
+func (p *PostgresConnector) sendStatusUpdate() {
+	err := pglogrepl.SendStandbyStatusUpdate(context.Background(), p.replConn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: p.lastRecievedLSN,
+		WALFlushPosition: p.lastRecievedLSN,
+		WALApplyPosition: p.lastRecievedLSN,
+		ClientTime:       time.Now(),
+		ReplyRequested:   false,
+	})
+	if err != nil {
+		fmt.Println("ERR: Could not send standby status: ", err)
+	}
+}
+
+func logLSN(lsn string) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		fmt.Println("OS ERR: Could not find log file dir: ", err)
+		return
+	}
+	logFile := configDir + "/cdc-pipe/log.txt"
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		fmt.Println("OS ERR: Could not open log.txt", err)
+		return
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(lsn)
+	if err != nil {
+		fmt.Println("OS ERR: Could not write LSN", err)
+		return
+	}
+}
+
+func fetchLastLSN() (pglogrepl.LSN, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return 0, err
+	}
+
+	logFile := configDir + "/cdc-pipe/log.txt"
+
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	// Parse the LSN string
+	lsnStr := string(data)
+	// You might need to trim whitespace
+	lsnStr = strings.TrimSpace(lsnStr)
+
+	lsn, err := pglogrepl.ParseLSN(lsnStr)
+	if err != nil {
+		return 0, err
+	}
+
+	return lsn, nil
 }

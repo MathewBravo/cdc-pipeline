@@ -15,6 +15,7 @@ const (
 
 type ChangeEvent struct {
 	Operation Operation
+	NameSpace string
 	Table     string
 	Before    map[string]any
 	After     map[string]any

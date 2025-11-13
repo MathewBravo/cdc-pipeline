@@ -9,9 +9,12 @@ import (
 
 	"github.com/MathewBravo/cdc-pipeline/internal/configs"
 	"github.com/MathewBravo/cdc-pipeline/internal/connector"
+	i "github.com/MathewBravo/cdc-pipeline/internal/init"
 )
 
 func main() {
+	i.Init()
+
 	// 1. Load config
 	cfg, err := configs.Load("./data/config.yaml")
 	if err != nil {
