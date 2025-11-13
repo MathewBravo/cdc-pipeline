@@ -1,12 +1,4 @@
-// TODO: Implement logical replication message decoding.
-// Currently the connector receives raw *pgproto3.CopyData frames from Postgres.
-// Next steps:
-//  1. Detect XLogData vs PrimaryKeepaliveMessage frames (m.Data[0]).
-//  2. Parse XLogData using pglogrepl.ParseXLogData.
-//  3. Decode the WALData payload with pglogrepl.Parse to extract logical messages
-//     (Begin, Relation, Insert, Update, Delete, Commit).
-//  4. Map these messages into events.ChangeEvent structs and push them to eventChan.
-//  5. (Later) Send periodic standby status updates to prevent connection timeout.
+// TODO: Persist the LSN
 
 // Resources For Writeup
 // https://www.postgresql.org/docs/16//protocol-replication.html
@@ -20,6 +12,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/MathewBravo/cdc-pipeline/internal/configs"
@@ -31,10 +24,11 @@ import (
 
 type PostgresConnector struct {
 	// config, db connection, etc.
-	config    configs.SourceConfig
-	replConn  *pgconn.PgConn
-	eventChan chan events.ChangeEvent
-	stopChan  chan struct{}
+	config        configs.SourceConfig
+	replConn      *pgconn.PgConn
+	eventChan     chan events.ChangeEvent
+	stopChan      chan struct{}
+	relationCache map[uint32]pglogrepl.RelationMessage
 }
 
 type LatestMessage struct {
@@ -43,9 +37,10 @@ type LatestMessage struct {
 
 func NewPGConnector(cfg configs.SourceConfig) *PostgresConnector {
 	return &PostgresConnector{
-		config:    cfg,
-		eventChan: make(chan events.ChangeEvent, 100),
-		stopChan:  make(chan struct{}),
+		config:        cfg,
+		eventChan:     make(chan events.ChangeEvent, 100),
+		stopChan:      make(chan struct{}),
+		relationCache: make(map[uint32]pglogrepl.RelationMessage),
 	}
 }
 
@@ -127,12 +122,12 @@ func (p *PostgresConnector) replicationLoop() {
 				fmt.Printf("Error receiving message: %v\n", err)
 				return
 			}
-			ReadMessage(msg, &lm, p.replConn)
+			p.ReadMessage(msg, &lm)
 		}
 	}
 }
 
-func ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage, conn *pgconn.PgConn) {
+func (p *PostgresConnector) ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage) {
 	copyD, ok := bm.(*pgproto3.CopyData)
 	if !ok {
 		fmt.Println("ReceiveMessage that was not CopyData message")
@@ -160,9 +155,9 @@ func ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage, conn *pgconn.PgC
 			fmt.Println("PARSE ERR: Could not parse WAL data: ", err)
 		}
 
-		handleLogicalReplicationMessage(wd)
+		p.handleLogicalReplicationMessage(wd, lm)
 	case 'k':
-		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{
+		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), p.replConn, pglogrepl.StandbyStatusUpdate{
 			WALWritePosition: lm.lastRecievedLSN,
 			WALFlushPosition: lm.lastRecievedLSN,
 			WALApplyPosition: lm.lastRecievedLSN,
@@ -177,19 +172,90 @@ func ReadMessage(bm pgproto3.BackendMessage, lm *LatestMessage, conn *pgconn.PgC
 	}
 }
 
-func handleLogicalReplicationMessage(walMessage pglogrepl.Message) {
+func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl.Message, lm *LatestMessage) {
 	switch walMessage.Type() {
-	case pglogrepl.MessageTypeBegin:
-		fmt.Println("BEGIN MESSAGE")
-	case pglogrepl.MessageTypeCommit:
-		fmt.Println("COMMIT MESSAGE")
-	case pglogrepl.MessageTypeInsert:
-		fmt.Println("INSERT MESSAGE")
+	case pglogrepl.MessageTypeRelation:
+		relationMsg, ok := walMessage.(*pglogrepl.RelationMessage)
+		if !ok {
+			return
+		}
+		p.relationCache[relationMsg.RelationID] = *relationMsg
+		return
 	case pglogrepl.MessageTypeUpdate:
-		fmt.Println("UPDATE MESSAGE")
-	case pglogrepl.MessageTypeDelete:
-		fmt.Println("DELETE MESSAGE")
+		updateMsg, ok := walMessage.(*pglogrepl.UpdateMessage)
+		if !ok {
+			return
+		}
+		relMsg := p.relationCache[updateMsg.RelationID]
+
+		oldData := parseTupleData(updateMsg.OldTuple, &relMsg)
+		newData := parseTupleData(updateMsg.NewTuple, &relMsg)
+
+		ce := events.ChangeEvent{
+			Operation: events.OperationUpdate,
+			Table:     relMsg.RelationName,
+			Before:    oldData,
+			After:     newData,
+			Lsn:       lm.lastRecievedLSN.String(),
+		}
+
+		fmt.Println(ce.Pretty())
+		return
 	default:
-		fmt.Printf("OTHER MESSAGE: %s\n", walMessage.Type().String())
+		fmt.Println("MESSAGE TYPE: ", walMessage.Type().String())
+	}
+}
+
+func parseTupleData(tupleData *pglogrepl.TupleData, relationMsg *pglogrepl.RelationMessage) map[string]any {
+	if tupleData == nil {
+		return nil
+	}
+	result := make(map[string]any)
+	for i := range len(tupleData.Columns) {
+		colName := relationMsg.Columns[i].Name
+		colTypeOID := relationMsg.Columns[i].DataType
+		tupleCol := tupleData.Columns[i]
+
+		switch tupleCol.DataType {
+		case 'n':
+			result[colName] = nil
+		case 't':
+			data := parseByOID(tupleCol.Data, colTypeOID)
+			result[colName] = data
+		default:
+			fmt.Println("UNSUPPORTED TUPLE DATATYPE")
+		}
+	}
+
+	return result
+}
+
+func parseByOID(data []byte, oid uint32) any {
+	text := string(data)
+	switch oid {
+	case 23: // int4
+		val, _ := strconv.ParseInt(text, 10, 32)
+		return int32(val)
+	case 20: // int8 (bigint)
+		val, _ := strconv.ParseInt(text, 10, 64)
+		return val
+	case 25, 1043: // text, varchar
+		return text
+	case 16: // bool
+		return text == "t" || text == "true"
+	case 1114: // timestamp without timezone
+		t, _ := time.Parse("2006-01-02 15:04:05", text)
+		return t
+	case 1184: // timestamp with timezone
+		t, _ := time.Parse("2006-01-02 15:04:05.999999-07", text)
+		return t
+	case 1700: // numeric/decimal
+		val, _ := strconv.ParseFloat(text, 64)
+		return val
+	case 701: // float8
+		val, _ := strconv.ParseFloat(text, 64)
+		return val
+	default:
+		return text
 	}
 }
