@@ -1,12 +1,3 @@
-// TODO: Persist the LSN
-
-// Resources For Writeup
-// https://www.postgresql.org/docs/16//protocol-replication.html
-// https://packagemain.tech/p/real-time-database-change-tracking
-// https://pkg.go.dev/github.com/jackc/pglogrepl
-// https://pkg.go.dev/github.com/jackc/pgx/v5/pgproto3
-// https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn
-
 package connector
 
 import (
@@ -26,7 +17,6 @@ import (
 )
 
 type PostgresConnector struct {
-	// config, db connection, etc.
 	config          configs.SourceConfig
 	replConn        *pgconn.PgConn
 	eventChan       chan events.ChangeEvent
@@ -68,9 +58,6 @@ func (p *PostgresConnector) Start() (<-chan events.ChangeEvent, error) {
 }
 
 func (p *PostgresConnector) Stop() error {
-	// 1. Signal goroutine to stop
-	// 2. Close channel
-	// 3. Cleanup resources
 	p.stopChan <- struct{}{}
 	p.replConn.Close(context.Background())
 	p.wg.Wait()
@@ -364,9 +351,7 @@ func fetchLastLSN() (pglogrepl.LSN, error) {
 		return 0, err
 	}
 
-	// Parse the LSN string
 	lsnStr := string(data)
-	// You might need to trim whitespace
 	lsnStr = strings.TrimSpace(lsnStr)
 
 	lsn, err := pglogrepl.ParseLSN(lsnStr)

@@ -8,8 +8,9 @@ import (
 )
 
 type Config struct {
-	Source SourceConfig `yaml:"source"`
-	CDC    CDCConfig    `yaml:"cdc"`
+	Source   SourceConfig   `yaml:"source"`
+	CDC      CDCConfig      `yaml:"cdc"`
+	Pipeline PipelineConfig `yaml:"pipeline"`
 }
 
 type SourceConfig struct {
@@ -26,6 +27,23 @@ type SourceConfig struct {
 type CDCConfig struct {
 	StartingLSN       string `yaml:"starting_lsn"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"`
+}
+
+type PipelineConfig struct {
+	Tables         map[string]TableOptions `yaml:"tables"`
+	DefaultRoute   string                  `yaml:"default_route"`
+	ExcludedTables []string                `yaml:"excluded_tables"`
+}
+
+type TableOptions struct {
+	Operations []string  `yaml:"operations"`
+	PIIMasks   []PIIMask `yaml:"pii_masks"`
+	Route      string    `yaml:"route_to"`
+}
+
+type PIIMask struct {
+	Field  string `yaml:"field"`
+	Action string `yaml:"action"`
 }
 
 func Load(path string) (*Config, error) {
@@ -57,21 +75,4 @@ func Load(path string) (*Config, error) {
 
 func verifyConfig(config CDCConfig) error {
 	return nil
-}
-
-func (c *Config) PrettyPrint() {
-	fmt.Println("Config:")
-	fmt.Println("source: ")
-	fmt.Printf("\thost: %s\n", c.Source.Host)
-	fmt.Printf("\tport: %d\n", c.Source.Port)
-	fmt.Printf("\tdatabase: %s\n", c.Source.Database)
-	fmt.Printf("\tuser: %s\n", c.Source.User)
-	fmt.Printf("\tslot_name: %s\n", c.Source.SlotName)
-	fmt.Printf("\tpublication_name: %s\n", c.Source.PublicationName)
-	fmt.Printf("\tssl_mode: %s\n", c.Source.SSLMode)
-	fmt.Printf("\tpassword: %s\n", c.Source.Password)
-
-	fmt.Println("cdc:")
-	fmt.Printf("\tstarting_lsn: %s\n", c.CDC.StartingLSN)
-	fmt.Printf("\theartbeat_interval: %s\n", c.CDC.HeartbeatInterval)
 }
