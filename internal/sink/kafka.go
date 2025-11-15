@@ -1,37 +1,5 @@
 package sink
 
-// TODO: Tomorrow's tasks for Kafka sink implementation
-//
-// 1. Parse compression from config string → kgo.CompressionCodec
-//    - Map "snappy", "gzip", "lz4", "zstd", "none" to kgo types
-//    - Handle invalid compression values
-//
-// 2. Use config.BatchSize and config.FlushInterval
-//    - Convert to kgo.ProducerBatchMaxBytes() and kgo.ProducerLinger()
-//    - Handle zero/nil values with sensible defaults
-//
-// 3. Implement Start() method:
-//    - Start goroutine with for-range loop over eventCh
-//    - For each event:
-//      a. Serialize event to JSON (json.Marshal)
-//      b. Extract primary key for partitioning (how to identify PK field?)
-//      c. Create kgo.Record with Topic, Key, Value
-//      d. Produce to Kafka (sync or async?)
-//    - Handle context for shutdown
-//    - Close Kafka client on exit
-//
-// 4. Error handling:
-//    - Handle NewClient errors properly (don't return nil)
-//    - Handle produce errors and retries
-//    - Logging for failed messages
-//
-// 5. Primary key extraction strategy:
-//    - Look for "id" field in After/Before maps?
-//    - Use LSN as fallback?
-//    - Make it configurable?
-//
-// 6. Add Stop() method for graceful shutdown
-
 import (
 	"context"
 	"encoding/json"
@@ -44,7 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// kgo.SeedBrokers("10.255.255.254:9092")
+// kgo.SeedBrokers("10.255.255.254:9092 WSL WINDOWS IP")
 type KafkaSink struct {
 	client   *kgo.Client
 	config   *configs.SinkConfig
@@ -87,11 +55,7 @@ func (k *KafkaSink) Start(eventCh <-chan events.ChangeEvent) error {
 					fmt.Printf("ERROR: Failed to handle event: %v\n", err)
 					continue
 				}
-				err = k.produceRecord(record)
-				if err != nil {
-					fmt.Printf("ERROR: Failed to produce record: %v\n", err)
-					continue
-				}
+				k.produceRecord(record)
 			case <-k.stopChan:
 				k.client.Close()
 				return
@@ -121,8 +85,12 @@ func (k *KafkaSink) handleEvent(event events.ChangeEvent) (*kgo.Record, error) {
 	}, nil
 }
 
-func (k *KafkaSink) produceRecord(record *kgo.Record) error {
-	return k.client.ProduceSync(context.Background(), record).FirstErr()
+func (k *KafkaSink) produceRecord(record *kgo.Record) {
+	k.client.Produce(context.Background(), record, func(r *kgo.Record, err error) {
+		if err != nil {
+			fmt.Printf("ERROR: Produce failed: %v\n", err)
+		}
+	})
 }
 
 func getCompression(compression string) kgo.CompressionCodec {

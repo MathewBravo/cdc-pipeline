@@ -106,6 +106,7 @@ func (p *PostgresConnector) replicationLoop() {
 		select {
 		case <-p.stopChan:
 			fmt.Println("Stop signal received")
+			p.replConn.Close(context.Background())
 			return
 		case <-ticker.C:
 			// TODO: Send standby status update
