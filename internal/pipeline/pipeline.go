@@ -114,6 +114,7 @@ func (p *Pipeline) determineRoute(event events.ChangeEvent) events.ChangeEvent {
 		return event
 	}
 	route := tableOptions.Route
+	fmt.Println("ROUTE: ", route)
 	event.Route = route
 	return event
 }

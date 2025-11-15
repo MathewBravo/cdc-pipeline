@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/MathewBravo/cdc-pipeline/internal/configs"
 	"github.com/MathewBravo/cdc-pipeline/internal/events"
@@ -48,6 +49,7 @@ type KafkaSink struct {
 	client   *kgo.Client
 	config   *configs.SinkConfig
 	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 func NewKafkaSink(cfg *configs.SinkConfig) (*KafkaSink, error) {
@@ -65,13 +67,14 @@ func NewKafkaSink(cfg *configs.SinkConfig) (*KafkaSink, error) {
 	}
 
 	return &KafkaSink{
-		client: cl,
-		config: cfg,
+		client:   cl,
+		config:   cfg,
+		stopChan: make(chan struct{}),
 	}, nil
 }
 
 func (k *KafkaSink) Start(eventCh <-chan events.ChangeEvent) error {
-	go func() {
+	k.wg.Go(func() {
 		for {
 			select {
 			case event, ok := <-eventCh:
@@ -94,11 +97,13 @@ func (k *KafkaSink) Start(eventCh <-chan events.ChangeEvent) error {
 				return
 			}
 		}
-	}()
+	})
 	return nil
 }
 
 func (k *KafkaSink) Stop() {
+	close(k.stopChan)
+	k.wg.Wait()
 }
 
 func (k *KafkaSink) handleEvent(event events.ChangeEvent) (*kgo.Record, error) {
