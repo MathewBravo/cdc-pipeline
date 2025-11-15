@@ -33,7 +33,10 @@ package sink
 // 6. Add Stop() method for graceful shutdown
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/MathewBravo/cdc-pipeline/internal/configs"
 	"github.com/MathewBravo/cdc-pipeline/internal/events"
@@ -42,26 +45,92 @@ import (
 
 // kgo.SeedBrokers("10.255.255.254:9092")
 type KafkaSink struct {
-	client *kgo.Client
-	config *configs.SinkConfig
+	client   *kgo.Client
+	config   *configs.SinkConfig
+	stopChan chan struct{}
 }
 
-func NewKafkaSink(cfg *configs.SinkConfig) *KafkaSink {
+func NewKafkaSink(cfg *configs.SinkConfig) (*KafkaSink, error) {
+	cmp := getCompression(cfg.Compression)
+	batch := cfg.BatchSize * 1024
+
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
-		kgo.ProducerBatchMaxBytes(1000000),
+		kgo.ProducerBatchCompression(cmp),
+		kgo.ProducerBatchMaxBytes(int32(batch)),
+		kgo.ProducerLinger(cfg.FlushInterval),
 	)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	return &KafkaSink{
 		client: cl,
 		config: cfg,
-	}
+	}, nil
 }
 
 func (k *KafkaSink) Start(eventCh <-chan events.ChangeEvent) error {
-	return fmt.Errorf("Hello")
+	go func() {
+		for {
+			select {
+			case event, ok := <-eventCh:
+				if !ok {
+					k.client.Close()
+					return
+				}
+				record, err := k.handleEvent(event)
+				if err != nil {
+					fmt.Printf("ERROR: Failed to handle event: %v\n", err)
+					continue
+				}
+				err = k.produceRecord(record)
+				if err != nil {
+					fmt.Printf("ERROR: Failed to produce record: %v\n", err)
+					continue
+				}
+			case <-k.stopChan:
+				k.client.Close()
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (k *KafkaSink) Stop() {
+}
+
+func (k *KafkaSink) handleEvent(event events.ChangeEvent) (*kgo.Record, error) {
+	jsonEvent, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+
+	pk := strings.Join(event.PK, "|")
+
+	return &kgo.Record{
+		Topic: event.Route,
+		Key:   []byte(pk),
+		Value: jsonEvent,
+	}, nil
+}
+
+func (k *KafkaSink) produceRecord(record *kgo.Record) error {
+	return k.client.ProduceSync(context.Background(), record).FirstErr()
+}
+
+func getCompression(compression string) kgo.CompressionCodec {
+	switch compression {
+	case "gzip":
+		return kgo.GzipCompression()
+	case "snappy":
+		return kgo.SnappyCompression()
+	case "lz4":
+		return kgo.Lz4Compression()
+	case "zstd":
+		return kgo.ZstdCompression()
+	default:
+		return kgo.NoCompression()
+	}
 }

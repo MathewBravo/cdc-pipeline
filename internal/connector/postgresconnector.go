@@ -189,6 +189,7 @@ func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl
 			Before:    oldData,
 			After:     newData,
 			Lsn:       p.lastRecievedLSN.String(),
+			PK:        getPKColumns(&relMsg),
 		}
 
 		fmt.Println(ce.Pretty())
@@ -210,6 +211,7 @@ func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl
 			Before:    delData,
 			After:     nil,
 			Lsn:       p.lastRecievedLSN.String(),
+			PK:        getPKColumns(&relMsg),
 		}
 
 		fmt.Println(ce.Pretty())
@@ -231,6 +233,7 @@ func (p *PostgresConnector) handleLogicalReplicationMessage(walMessage pglogrepl
 			Before:    nil,
 			After:     newData,
 			Lsn:       p.lastRecievedLSN.String(),
+			PK:        getPKColumns(&relMsg),
 		}
 
 		fmt.Println(ce.Pretty())
@@ -360,4 +363,14 @@ func fetchLastLSN() (pglogrepl.LSN, error) {
 	}
 
 	return lsn, nil
+}
+
+func getPKColumns(relMSG *pglogrepl.RelationMessage) []string {
+	var pkCols []string
+	for _, col := range relMSG.Columns {
+		if col.Flags == 1 {
+			pkCols = append(pkCols, col.Name)
+		}
+	}
+	return pkCols
 }
