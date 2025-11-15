@@ -37,6 +37,7 @@ func (p *Pipeline) processLoop(eventCh <-chan events.ChangeEvent) {
 			continue
 		}
 		event = p.applyPIIMasks(event)
+		event = p.determineRoute(event)
 		p.outputCh <- event
 	}
 	close(p.outputCh)
@@ -104,4 +105,15 @@ func maskPartial(s string) string {
 		return strings.Repeat("*", n)
 	}
 	return strings.Repeat("*", n-4) + s[n-4:]
+}
+
+func (p *Pipeline) determineRoute(event events.ChangeEvent) events.ChangeEvent {
+	tableOptions, exists := p.config.Tables[event.Table]
+	if !exists {
+		event.Route = p.config.DefaultRoute
+		return event
+	}
+	route := tableOptions.Route
+	event.Route = route
+	return event
 }

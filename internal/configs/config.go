@@ -3,6 +3,7 @@ package configs
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/goccy/go-yaml"
 )
@@ -11,6 +12,7 @@ type Config struct {
 	Source   SourceConfig   `yaml:"source"`
 	CDC      CDCConfig      `yaml:"cdc"`
 	Pipeline PipelineConfig `yaml:"pipeline"`
+	Sink     SinkConfig     `yaml:"sink"`
 }
 
 type SourceConfig struct {
@@ -33,6 +35,14 @@ type PipelineConfig struct {
 	Tables         map[string]TableOptions `yaml:"tables"`
 	DefaultRoute   string                  `yaml:"default_route"`
 	ExcludedTables []string                `yaml:"excluded_tables"`
+}
+
+type SinkConfig struct {
+	Type          string        `yaml:"type"`
+	Brokers       []string      `yaml:"brokers"`
+	Compression   string        `yaml:"compression"`
+	BatchSize     int           `yaml:"batch_size"`
+	FlushInterval time.Duration `yaml:"flush_interval"`
 }
 
 type TableOptions struct {

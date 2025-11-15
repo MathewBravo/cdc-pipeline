@@ -20,6 +20,7 @@ type ChangeEvent struct {
 	Before    map[string]any
 	After     map[string]any
 	Lsn       string
+	Route     string
 	// !TODO: Include later, info about the system, commit time
 	// TsMs      time.Time
 	// TsNs      time.Time
